@@ -436,12 +436,18 @@ impl<T: Item> Picker<T> {
         picker
     }
 
-    pub fn score(&mut self) {
+    pub fn score(&mut self, skip_on_pattern_unchanged: bool) {
         let now = Instant::now();
 
         let pattern = self.prompt.line();
+        log::debug!("pattern: {pattern}");
 
-        if pattern == &self.previous_pattern {
+        if skip_on_pattern_unchanged && pattern == &self.previous_pattern {
+            log::debug!(
+                "skip_on_pattern_unchanged: {skip_on_pattern_unchanged} pattern: {pattern} same as previous pattern: {}",
+                self.previous_pattern
+            );
+            log::debug!("self.matches: {:?}", self.matches);
             return;
         }
 
@@ -457,6 +463,7 @@ impl<T: Item> Picker<T> {
                         len: text.chars().count(),
                     }
                 }));
+            log::debug!("Empty pattern; returning all matches: {:?}", self.matches);
         } else if pattern.starts_with(&self.previous_pattern) {
             let query = FuzzyQuery::new(pattern);
             // optimization: if the pattern is a more specific version of the previous one
@@ -476,6 +483,10 @@ impl<T: Item> Picker<T> {
             });
 
             self.matches.sort_unstable();
+            log::debug!(
+                "Filtered matches based on pattern {pattern}:\n{:?}",
+                self.matches
+            );
         } else {
             self.force_score();
         }
@@ -565,7 +576,7 @@ impl<T: Item> Picker<T> {
     fn prompt_handle_event(&mut self, event: &Event, cx: &mut Context) -> EventResult {
         if let EventResult::Consumed(_) = self.prompt.handle_event(event, cx) {
             // TODO: recalculate only if pattern changed
-            self.score();
+            self.score(true);
         }
         EventResult::Consumed(None)
     }
@@ -771,27 +782,69 @@ impl<T: Item + 'static> Component for Picker<T> {
 pub type DynQueryCallback<T> =
     Box<dyn Fn(String, &mut Editor) -> BoxFuture<'static, anyhow::Result<Vec<T>>>>;
 
-/// A picker that updates its contents via a callback whenever the
+/// A picker that can update its contents, optionally via a callback whenever the
 /// query string changes. Useful for live grep, workspace symbols, etc.
 pub struct DynamicPicker<T: ui::menu::Item + Send> {
     file_picker: FilePicker<T>,
-    query_callback: DynQueryCallback<T>,
+    query_callback: Option<DynQueryCallback<T>>,
     query: String,
 }
 
-impl<T: ui::menu::Item + Send> DynamicPicker<T> {
+use std::fmt::Debug;
+impl<T: ui::menu::Item + Send + Debug + 'static> DynamicPicker<T> {
     pub const ID: &'static str = "dynamic-picker";
 
-    pub fn new(file_picker: FilePicker<T>, query_callback: DynQueryCallback<T>) -> Self {
+    pub fn new(file_picker: FilePicker<T>) -> Self {
         Self {
             file_picker,
-            query_callback,
+            query_callback: None,
             query: String::new(),
         }
     }
+
+    pub fn with_query_callback(mut self, query_callback: DynQueryCallback<T>) -> Self {
+        self.query_callback = Some(query_callback);
+        self
+    }
+
+    pub fn find_picker<'a>(compositor: &'a mut Compositor) -> Option<&'a mut Picker<T>> {
+        // Wrapping of pickers in overlay is done outside the picker code,
+        // so this is fragile and will break if wrapped in some other widget.
+        compositor
+            .find_id::<Overlay<DynamicPicker<T>>>(Self::ID)
+            .map(|overlay| &mut overlay.content.file_picker.picker)
+    }
+
+    pub fn set_new_picker_options(
+        editor: &mut Editor,
+        compositor: &mut Compositor,
+        new_options: Vec<T>,
+    ) {
+        Self::find_picker(compositor).map(|picker| {
+            picker.options = new_options;
+            picker.cursor = 0;
+            picker.force_score();
+            editor.reset_idle_timer();
+        });
+    }
+
+    pub fn add_new_picker_options(editor: &mut Editor, compositor: &mut Compositor, new_option: T) {
+        Self::find_picker(compositor).map(|picker| {
+            picker.options.push(new_option);
+            log::debug!("picker options: {:?}", picker.options);
+            log::debug!("computing score");
+            picker.score(false);
+            log::debug!("done computing score");
+            editor.reset_idle_timer();
+        });
+    }
+
+    pub fn get_picker_options<'a>(compositor: &'a mut Compositor) -> Option<&'a mut Vec<T>> {
+        Self::find_picker(compositor).map(|picker| &mut picker.options)
+    }
 }
 
-impl<T: Item + Send + 'static> Component for DynamicPicker<T> {
+impl<T: Item + Send + Debug + 'static> Component for DynamicPicker<T> {
     fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
         self.file_picker.render(area, surface, cx);
     }
@@ -804,27 +857,20 @@ impl<T: Item + Send + 'static> Component for DynamicPicker<T> {
             return event_result;
         }
 
-        self.query.clone_from(current_query);
+        if let Some(query_callback) = self.query_callback.as_ref() {
+            self.query.clone_from(current_query);
 
-        let new_options = (self.query_callback)(current_query.to_owned(), cx.editor);
+            let new_options = (query_callback)(current_query.to_owned(), cx.editor);
 
-        cx.jobs.callback(async move {
-            let new_options = new_options.await?;
-            let callback =
-                crate::job::Callback::EditorCompositor(Box::new(move |editor, compositor| {
-                    // Wrapping of pickers in overlay is done outside the picker code,
-                    // so this is fragile and will break if wrapped in some other widget.
-                    let picker = match compositor.find_id::<Overlay<DynamicPicker<T>>>(Self::ID) {
-                        Some(overlay) => &mut overlay.content.file_picker.picker,
-                        None => return,
-                    };
-                    picker.options = new_options;
-                    picker.cursor = 0;
-                    picker.force_score();
-                    editor.reset_idle_timer();
-                }));
-            anyhow::Ok(callback)
-        });
+            cx.jobs.callback(async move {
+                let new_options = new_options.await?;
+                let callback =
+                    crate::job::Callback::EditorCompositor(Box::new(move |editor, compositor| {
+                        Self::set_new_picker_options(editor, compositor, new_options);
+                    }));
+                anyhow::Ok(callback)
+            });
+        }
         EventResult::Consumed(None)
     }
 

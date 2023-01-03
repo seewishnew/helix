@@ -1,4 +1,4 @@
-use std::ops::Deref;
+use std::{borrow::Borrow, ops::Deref};
 
 use crate::job::Job;
 
@@ -325,6 +325,258 @@ fn write(
     }
 
     write_impl(cx, args.first(), false)
+}
+
+pub mod global_search {
+    use anyhow::{anyhow, Result};
+    use futures_util::future::BoxFuture;
+    use futures_util::{FutureExt, StreamExt};
+    use grep_regex::RegexMatcherBuilder;
+    use grep_searcher::{sinks, BinaryDetection, SearcherBuilder};
+    use helix_core::Selection;
+    use helix_view::{align_view, Align, Editor};
+    use ignore::{DirEntry, WalkBuilder, WalkState};
+    use std::convert::AsRef;
+    use std::path::{Path, PathBuf};
+    use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+    use tokio_stream::wrappers::UnboundedReceiverStream;
+    use tui::text::Spans;
+
+    use crate::job::Job;
+    use crate::ui::DynamicPicker;
+    use crate::{
+        compositor::Compositor,
+        job::{self, Callback, Jobs},
+        ui::{self, overlay::overlayed, FilePicker},
+    };
+
+    #[derive(Debug)]
+    pub struct FileResult {
+        pub path: PathBuf,
+        /// 0 indexed lines
+        pub line_num: usize,
+    }
+
+    impl FileResult {
+        pub fn new(path: &Path, line_num: usize) -> Self {
+            Self {
+                path: path.to_path_buf(),
+                line_num,
+            }
+        }
+    }
+
+    impl ui::menu::Item for FileResult {
+        type Data = Option<PathBuf>;
+
+        fn label(&self, current_path: &Self::Data) -> Spans {
+            let relative_path = helix_core::path::get_relative_path(&self.path)
+                .to_string_lossy()
+                .into_owned();
+            if current_path
+                .as_ref()
+                .map(|p| p == &self.path)
+                .unwrap_or(false)
+            {
+                format!("{} (*)", relative_path).into()
+            } else {
+                relative_path.into()
+            }
+        }
+    }
+
+    pub fn collect_file_results(
+        editor: &mut Editor,
+        jobs: &mut Jobs,
+        all_matches_rx: UnboundedReceiver<FileResult>,
+    ) {
+        let current_path = doc_mut!(editor).path().cloned();
+        let match_stream = UnboundedReceiverStream::new(all_matches_rx);
+        let show_picker = async move {
+            // The first result is special because depending on whether or not
+            // the first result is positive or not we will either display an error
+            // message indicating no matches were found or else we will display
+            // the dynamic picker with the first result.
+            let (first_res, remaining_stream) = match_stream.into_future().await;
+            let call: job::Callback = Callback::EditorCompositorStreamFuture(Box::new(
+                move |editor: &mut Editor, compositor: &mut Compositor| -> Option<Job> {
+                    if first_res.is_none() {
+                        editor.set_status("No matches found");
+                        return None;
+                    }
+
+                    let res = first_res.unwrap();
+                    log::debug!("first res: {res:?}");
+                    let picker = gs_picker(vec![res], current_path);
+                    let dyn_picker = DynamicPicker::new(picker);
+                    compositor.push(Box::new(overlayed(dyn_picker)));
+
+                    Some(Job::with_callback(fetch_next_result(remaining_stream)))
+                },
+            ));
+            Ok(call)
+        };
+        jobs.callback(show_picker);
+    }
+
+    fn fetch_next_result(
+        remaining_stream: UnboundedReceiverStream<FileResult>,
+    ) -> BoxFuture<'static, anyhow::Result<Callback>> {
+        async move {
+            let (next_res, remaining_stream) = remaining_stream.into_future().await;
+            if next_res.is_none() {
+                return Ok(Callback::Noop);
+            }
+
+            let res = next_res.unwrap();
+            log::debug!("res: {res:?}");
+            let callback =
+                Callback::EditorCompositorStreamFuture(Box::new(move |editor, compositor| {
+                    DynamicPicker::add_new_picker_options(editor, compositor, res);
+                    Some(Job::with_callback(fetch_next_result(remaining_stream)))
+                }));
+            Ok(callback)
+        }
+        .boxed()
+    }
+
+    fn gs_picker(
+        file_options: Vec<FileResult>,
+        current_path: Option<PathBuf>,
+    ) -> FilePicker<FileResult> {
+        FilePicker::new(
+            file_options,
+            current_path,
+            move |cx, FileResult { path, line_num }, action| {
+                match cx.editor.open(path, action) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        cx.editor.set_error(format!(
+                            "Failed to open file '{}': {}",
+                            path.display(),
+                            e
+                        ));
+                        return;
+                    }
+                }
+
+                let line_num = *line_num;
+                let (view, doc) = current!(cx.editor);
+                let text = doc.text();
+                let start = text.line_to_char(line_num);
+                let end = text.line_to_char((line_num + 1).min(text.len_lines()));
+
+                doc.set_selection(view.id, Selection::single(start, end));
+                align_view(doc, view, Align::Center);
+            },
+            |_editor, FileResult { path, line_num }| {
+                Some((path.clone().into(), Some((*line_num, *line_num))))
+            },
+        )
+    }
+
+    pub fn launch_search_walkers(
+        editor: &mut Editor,
+        regex: impl AsRef<str>,
+        all_matches_sx: UnboundedSender<FileResult>,
+    ) -> anyhow::Result<()> {
+        let config = editor.config();
+        let smart_case = config.search.smart_case;
+        let file_picker_config = config.file_picker.clone();
+
+        if let Ok(matcher) = RegexMatcherBuilder::new()
+            .case_smart(smart_case)
+            .build(regex.as_ref())
+        {
+            let searcher = SearcherBuilder::new()
+                .binary_detection(BinaryDetection::quit(b'\x00'))
+                .build();
+
+            let search_root =
+                std::env::current_dir().expect("Global search error: Failed to get current dir");
+            WalkBuilder::new(search_root)
+                .hidden(file_picker_config.hidden)
+                .parents(file_picker_config.parents)
+                .ignore(file_picker_config.ignore)
+                .follow_links(file_picker_config.follow_symlinks)
+                .git_ignore(file_picker_config.git_ignore)
+                .git_global(file_picker_config.git_global)
+                .git_exclude(file_picker_config.git_exclude)
+                .max_depth(file_picker_config.max_depth)
+                // We always want to ignore the .git directory, otherwise if
+                // `ignore` is turned off above, we end up with a lot of noise
+                // in our picker.
+                .filter_entry(|entry| entry.file_name() != ".git")
+                .build_parallel()
+                .run(|| {
+                    let mut searcher = searcher.clone();
+                    let matcher = matcher.clone();
+                    let all_matches_sx = all_matches_sx.clone();
+                    Box::new(move |entry: Result<DirEntry, ignore::Error>| -> WalkState {
+                        let entry = match entry {
+                            Ok(entry) => entry,
+                            Err(_) => return WalkState::Continue,
+                        };
+
+                        match entry.file_type() {
+                            Some(entry) if entry.is_file() => {}
+                            // skip everything else
+                            _ => return WalkState::Continue,
+                        };
+
+                        let result = searcher.search_path(
+                            &matcher,
+                            entry.path(),
+                            sinks::UTF8(|line_num, _| {
+                                all_matches_sx
+                                    .send(FileResult::new(entry.path(), line_num as usize - 1))
+                                    .unwrap();
+
+                                Ok(true)
+                            }),
+                        );
+
+                        if let Err(err) = result {
+                            log::error!("Global search error: {}, {}", entry.path().display(), err);
+                        }
+                        WalkState::Continue
+                    })
+                });
+            Ok(())
+        } else {
+            // Otherwise do nothing
+            let msg = "Global Search Invalid Pattern";
+            log::error!("{}", msg);
+            Err(anyhow!(msg))
+        }
+    }
+}
+
+pub mod search_utils {
+    use helix_core::regex;
+    use helix_view::Editor;
+    use std::collections::HashSet;
+
+    pub fn search_completions(editor: &Editor, reg: Option<char>) -> Vec<String> {
+        let mut items = reg
+            .and_then(|reg| editor.registers.get(reg))
+            .map_or(Vec::new(), |reg| reg.read().iter().take(200).collect());
+        items.sort_unstable();
+        items.dedup();
+        items.into_iter().cloned().collect()
+    }
+
+    pub fn regex_escaped_current_selection(editor: &mut Editor) -> String {
+        let (view, doc) = current!(editor);
+        let contents = doc.text().slice(..);
+        doc.selection(view.id)
+            .iter()
+            .map(|selection| regex::escape(&selection.fragment(contents)))
+            .collect::<HashSet<_>>() // Collect into hashset to deduplicate identical regexes
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join("|")
+    }
 }
 
 fn force_write(
@@ -2386,21 +2638,34 @@ pub(super) fn command_mode(cx: &mut Context) {
             } else {
                 // Otherwise, use the command's completer and the last shellword
                 // as completion input.
-                let (part, part_len) = if words.len() == 1 || shellwords.ends_with_whitespace() {
-                    (&Cow::Borrowed(""), 0)
+                let (mut part, part_len) = if words.len() == 1 || shellwords.ends_with_whitespace()
+                {
+                    (Cow::Borrowed(""), 0)
                 } else {
                     (
-                        words.last().unwrap(),
+                        words.last().unwrap().clone(),
                         shellwords.parts().last().unwrap().len(),
                     )
                 };
 
                 if let Some(typed::TypableCommand {
                     completer: Some(completer),
+                    name,
                     ..
                 }) = typed::TYPABLE_COMMAND_MAP.get(&words[0] as &str)
                 {
-                    completer(editor, part)
+                    if name.contains("search") {
+                        // We want the raw regex and not after
+                        // passing through shell words
+                        part = Cow::Borrowed(
+                            input
+                                .trim_start()
+                                .trim_start_matches(words.first().unwrap().as_ref())
+                                .trim_start(),
+                        );
+                    }
+
+                    completer(editor, &part)
                         .into_iter()
                         .map(|(range, file)| {
                             let file = shellwords::escape(file);
@@ -2433,9 +2698,15 @@ pub(super) fn command_mode(cx: &mut Context) {
             // Handle typable commands
             if let Some(cmd) = typed::TYPABLE_COMMAND_MAP.get(parts[0]) {
                 let shellwords = Shellwords::from(input);
-                let args = shellwords.words();
+                let args = if cmd.name.contains("search") {
+                    let regex_args: Vec<Cow<str>> =
+                        input.split_whitespace().skip(1).map(Cow::from).collect();
+                    Cow::Owned(regex_args)
+                } else {
+                    Cow::Borrowed(&shellwords.words()[1..])
+                };
 
-                if let Err(e) = (cmd.fun)(cx, &args[1..], event) {
+                if let Err(e) = (cmd.fun)(cx, args.borrow(), event) {
                     cx.editor.set_error(format!("{}", e));
                 }
             } else if event == PromptEvent::Validate {

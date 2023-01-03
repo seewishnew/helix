@@ -6,6 +6,8 @@ use futures_util::future::{BoxFuture, Future, FutureExt};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 
 pub enum Callback {
+    Noop,
+    EditorCompositorStreamFuture(Box<dyn FnOnce(&mut Editor, &mut Compositor) -> Option<Job>>),
     EditorCompositor(Box<dyn FnOnce(&mut Editor, &mut Compositor) + Send>),
     Editor(Box<dyn FnOnce(&mut Editor) + Send>),
 }
@@ -69,17 +71,23 @@ impl Jobs {
         editor: &mut Editor,
         compositor: &mut Compositor,
         call: anyhow::Result<Option<Callback>>,
-    ) {
+    ) -> Option<Job> {
         match call {
             Ok(None) => {}
             Ok(Some(call)) => match call {
+                Callback::EditorCompositorStreamFuture(call) => {
+                    return call(editor, compositor);
+                }
                 Callback::EditorCompositor(call) => call(editor, compositor),
                 Callback::Editor(call) => call(editor),
+                Callback::Noop => {}
             },
             Err(e) => {
                 editor.set_error(format!("Async job failed: {}", e));
             }
         }
+
+        None
     }
 
     pub async fn next_job(&mut self) -> Option<anyhow::Result<Option<Callback>>> {

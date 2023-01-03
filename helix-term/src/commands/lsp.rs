@@ -421,7 +421,7 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
                 };
                 future.boxed()
             };
-            let dyn_picker = DynamicPicker::new(picker, Box::new(get_symbols));
+            let dyn_picker = DynamicPicker::new(picker).with_query_callback(Box::new(get_symbols));
             compositor.push(Box::new(overlayed(dyn_picker)))
         },
     )

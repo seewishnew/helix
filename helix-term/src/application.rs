@@ -350,11 +350,19 @@ impl Application {
                     self.handle_signals(signal).await;
                 }
                 Some(callback) = self.jobs.futures.next() => {
-                    self.jobs.handle_callback(&mut self.editor, &mut self.compositor, callback);
+                    // If handling this current job returns another job
+                    // then enqueue it in our list of jobs
+                    if let Some(next_job) = self.jobs.handle_callback(&mut self.editor, &mut self.compositor, callback) {
+                        self.jobs.add(next_job);
+                    }
                     self.render().await;
                 }
                 Some(callback) = self.jobs.wait_futures.next() => {
-                    self.jobs.handle_callback(&mut self.editor, &mut self.compositor, callback);
+                    // If handling this current job returns another job
+                    // then enqueue it in our list of jobs
+                    if let Some(next_job) = self.jobs.handle_callback(&mut self.editor, &mut self.compositor, callback) {
+                        self.jobs.add(next_job);
+                    }
                     self.render().await;
                 }
                 event = self.editor.wait_event() => {
